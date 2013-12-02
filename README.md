@@ -1,4 +1,4 @@
-db-l10n
+DB-l10n
 =======
 
 Localization of database content
