@@ -1,4 +1,4 @@
--- DB-l10n. Localization of database content
+﻿-- DB-l10n. Localization of database content
 -- Copyright © 2013  Basil Peace
 
 /*
@@ -64,7 +64,6 @@ CREATE TYPE extension AS (
 	singleton extension_singleton, -- subtag ? name ?
 	subtags extension_subtags
 );
-CREATE DOMAIN extensions extension[];
 -- [BCP47] isn't clear whether privateuse subtag is one group of from  1  to  8
 --   alphanumerical characters or is a sequence of such groups.
 -- * ABNF states that privateuse subtag is a sequence starting with 'x-'
@@ -83,13 +82,13 @@ CREATE TYPE language_tag AS (
 --   NOT NULL, can be zero-length
 -- 5. Elements of arrays  of  strings  (variants  and  privateuse)  are  always
 --   NOT NULL and have length > 0
--- 6. Rules for extensions are described above
+-- 6. Rules for # are described above
 	language language_subtag,
 	extlang extlang_subtag,
 	script script_subtag,
 	region region_subtag,
 	variants variant_subtags,
-	extensions extensions,
+	extensions extension[],
 	privateuse privateuse_subtags,
 	grandfathered grandfathered_tag
 );
@@ -122,12 +121,12 @@ AS $$
 	END
 $$;
 
-CREATE FUNCTION str_to_extensions(str character varying) RETURNS extensions
+CREATE FUNCTION str_to_extensions(str character varying) RETURNS extension[]
 	LANGUAGE plpgsql IMMUTABLE -- RETURNS empty array on NULL input
 AS $$
 	DECLARE
 		ext_str character varying COLLATE "C";
-		res extensions = ARRAY[];
+		res extension[] = ARRAY[]::extension[];
 	BEGIN
 		LOOP
 			ext_str := (regexp_matches(str COLLATE "C", '^(-[0-9a-wy-z](?:-[0-9A-Za-z]{2,8})+)', 'ix'))[1];
@@ -169,14 +168,14 @@ AS $$
 			END IF;
 			res.language := COALESCE(arr[1], arr[3]);
 			res.extlang := arr[2];
-			res.script := arr[3];
-			res.region := arr[4];
-			res.variants := string_to_array(arr[5], '-');
+			res.script := arr[4];
+			res.region := arr[5];
+			res.variants := string_to_array(arr[6], '-');
 			IF res.variants IS NOT NULL THEN
 				res.variants := res.variants[2:array_length(res.variants, 1)];
 			END IF;
-			res.extensions := str_to_extensions(arr[5]);
-			res.privateuse := string_to_array(COALESCE(arr[7], arr[8]), '-');
+			res.extensions := str_to_extensions(arr[7]);
+			res.privateuse := string_to_array(COALESCE(arr[8], arr[9]), '-');
 			IF res.privateuse IS NOT NULL THEN
 				res.privateuse := res.privateuse[2:array_length(res.privateuse, 1)];
 			END IF;
@@ -193,12 +192,12 @@ AS $$
 	END
 $$;
 
-CREATE FUNCTION extensions_to_str(extensions extensions) RETURNS character varying
+CREATE FUNCTION extensions_to_str(extensions extension[]) RETURNS character varying
 	LANGUAGE plpgsql IMMUTABLE RETURNS NULL ON NULL INPUT
 AS $$
 	DECLARE
 		ext extension;
-		res_arr character varying[] COLLATE "C" = ARRAY[];
+		res_arr character varying[] COLLATE "C" = ARRAY[]::character varying[] COLLATE "C";
 	BEGIN
 		FOREACH ext IN ARRAY extensions LOOP
 			res_arr := res_arr || extension_to_str(ext);
@@ -217,26 +216,26 @@ AS $$
 			RETURN (langtag).grandfathered;
 		END IF;
 		IF (langtag).language IS NULL THEN
-			RETURN 'x-' + array_to_string((langtag).privateuse, '-');
+			RETURN 'x-' || array_to_string((langtag).privateuse, '-');
 		END IF;
 		RETURN
 			(langtag).language
-			+ COALESCE('-' + (langtag).extlang, '')
-			+ COALESCE('-' + (langtag).script, '')
-			+ COALESCE('-' + (langtag).region, '')
-			+ CASE
+			|| COALESCE('-' || (langtag).extlang, '')
+			|| COALESCE('-' || (langtag).script, '')
+			|| COALESCE('-' || (langtag).region, '')
+			|| CASE
 				WHEN array_length((langtag).variants, 1) > 0
-				THEN '-' + array_to_string((langtag).variants, '-')
+				THEN '-' || array_to_string((langtag).variants, '-')
 				ELSE ''
 			END
-			+ CASE
+			|| CASE
 				WHEN array_length((langtag).extensions, 1) > 0
-				THEN '-' + extensions_to_str((langtag).extensions, '-')
+				THEN '-' || extensions_to_str((langtag).extensions)
 				ELSE ''
 			END
-			+ CASE
+			|| CASE
 				WHEN array_length((langtag).privateuse, 1) > 0
-				THEN '-x-' + array_to_string((langtag).privateuse, '-')
+				THEN '-x-' || array_to_string((langtag).privateuse, '-')
 				ELSE ''
 			END
 		;
@@ -498,5 +497,3 @@ CREATE TYPE langtag_match_type AS ENUM (
 	'Script mismatch',
 	'No match'
 );
-
-ROLLBACK;
