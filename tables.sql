@@ -301,6 +301,9 @@ AS $$
 		j int;
 		primary_langtag language_tag;
 	BEGIN
+	
+-- TODO:
+-- Handle 'und', 'ZZ', etc.
 		res := langtag;
 		res.language := lower(res.language);
 		res.extlang  := lower(res.extlang);
@@ -337,6 +340,11 @@ AS $$
 		FOR i IN 1 .. array_length(res.variants, 1) LOOP
 			res.variants[i] := COALESCE(SELECT preferred_value FROM variants WHERE subtag = res.variants[i], res.variants[i]);
 		END LOOP;
+		
+		-- Handle Suppress-Script ?
+		IF res.region = '001' THEN -- Ignore region-neutral ('World') tag
+			res.region := NULL;
+		END IF;
 		
 		-- TODO: res.extlang can still be NOT NULL (see also the next function)
 	END
@@ -531,26 +539,6 @@ CREATE TABLE variant_comments (
 );
 
 
--- Records for extensions are stored in the separate registry,
---   with the following differences from records for other subtags:
---   1. There is no Deprecated field
---   2. There is only one Description field
---   3. There could be at most one Comments field
-
-CREATE TABLE extensions (
-	identifier extension_identifier PRIMARY KEY, -- <> 'x'
-	added date NOT NULL,
-	description text NOT NULL,
-	comments text,
--- TODO: Add length limits
-	rfc character varying NOT NULL,
-	authority character varying NOT NULL,
-	contacting_email character varying NOT NULL,
-	mailing_list character varying NOT NULL,
-	url character varying NOT NULL
-);
-
-
 CREATE TABLE grandfathereds (
 	tag grandfathered_tag PRIMARY KEY,
 	added date NOT NULL,
@@ -601,6 +589,26 @@ CREATE TABLE redundant_comments (
 );
 
 
+-- Records for extensions are stored in the separate registry,
+--   with the following differences from records for other subtags:
+--   1. There is no Deprecated field
+--   2. There is only one Description field
+--   3. There could be at most one Comments field
+
+CREATE TABLE extensions (
+	identifier extension_identifier PRIMARY KEY, -- <> 'x'
+	added date NOT NULL,
+	description text NOT NULL,
+	comments text,
+-- TODO: Add length limits
+	rfc character varying NOT NULL,
+	authority character varying NOT NULL,
+	contacting_email character varying NOT NULL,
+	mailing_list character varying NOT NULL,
+	url character varying NOT NULL
+);
+
+
 
 
 CREATE TYPE langtag_match_type AS ENUM (
@@ -616,7 +624,7 @@ CREATE TYPE langtag_match_type AS ENUM (
 	'Region match',
 	'Macro region match', -- Except 001 World
 	'Region-neutral match',
-	'Orphographic affinity match',
+	'Orthographic affinity match',
 	'Preferred region match',
 -- According to [BCP47], extensions are orthogonal  to  language  tag  matching
 --   However, some extensions (namely 't' extension  for  Transformed  Content)
@@ -632,7 +640,12 @@ CREATE TYPE langtag_match_type AS ENUM (
 
 
 
-CREATE FUNCTION localize_table(table_name name, columns name[], table_nsp_name name DEFAULT NULL) RETURNS VOID
+
+CREATE FUNCTION localize_table(
+	table_name name,
+	columns name[],
+	table_nsp_name name DEFAULT NULL
+) RETURNS VOID
 	LANGUAGE plpgsql VOLATILE
 AS $$
 	DECLARE
