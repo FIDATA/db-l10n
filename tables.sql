@@ -32,6 +32,16 @@ TODOs:
 */
 
 
+-- Note on case of characters:
+-- Language tags should be treated and compared case-insensitive.
+-- Canonicalization of language tags regularizes the case of the  subtags.  All
+-- comparisons evolving non-canonical tags are made in lowercase.
+-- However, tags and subtags in tables are assumed to  be  in  the  regularized
+-- case. It works for  data  imported  from  IANA  registry,  but  user-defined
+-- subtags should be added carefully, in proper case,  or  something  could  be
+-- broken
+
+
 -- Note on descriptions:
 -- According to [BCP 47]:
 -- 1. A particular description can be used more than once for multiple  records
@@ -44,7 +54,7 @@ TODOs:
 
 -- [RFC5646] ABNF includes extlang subtag into language subtag. However, we
 --   store them separately
-CREATE DOMAIN language_subtag character varying(8) COLLATE "C";
+CREATE DOMAIN language_subtag character varying(8) COLLATE "C"; -- Primary language subtag
 -- See [RFC5646], sect. 2.2.2., rule 4:
 -- Although ABNF allows use of three consecutive extlang subtags, subtags can't
 --   be Prefixes to another extlang subtags, so only use of one extlang  subtag
@@ -75,11 +85,11 @@ CREATE DOMAIN grandfathered_tag character varying(11) COLLATE "C";
 CREATE TYPE language_tag AS (
 -- 1. If grandfathered is NOT NULL, all other fields are NULL
 -- 2. If privateuse contains at least one element, language can be NULL
--- 3. If language is NULL, all fields except one of privateuse or grandfathered
---   are NULL
+-- 3. If language is  NULL,  all  fields  except  only  one  of  privateuse  or
+--   grandfathered are NULL
 -- 4. If language is NOT NULL, non-array fields (extlang,  script  and  region)
---   can be NULL.  Array  fields  (variants,  extensions  and  privateuse)  are
---   NOT NULL, can be zero-length
+--   can be NULL, can't be empty strings. Array  fields  (variants,  extensions
+--   and  privateuse) are NOT NULL, can be zero-length
 -- 5. Elements of arrays  of  strings  (variants  and  privateuse)  are  always
 --   NOT NULL and have length > 0
 -- 6. Rules for # are described above
@@ -252,30 +262,30 @@ CREATE FUNCTION langtag_to_str(langtag language_tag) RETURNS character varying
 	LANGUAGE plpgsql IMMUTABLE RETURNS NULL ON NULL INPUT
 AS $$
 	BEGIN
-		IF (langtag).grandfathered IS NOT NULL THEN
-			RETURN (langtag).grandfathered;
+		IF langtag.grandfathered IS NOT NULL THEN
+			RETURN langtag.grandfathered;
 		END IF;
-		IF (langtag).language IS NULL THEN
-			RETURN 'x-' || array_to_string((langtag).privateuse, '-');
+		IF langtag.language IS NULL THEN
+			RETURN 'x-' || array_to_string(langtag.privateuse, '-');
 		END IF;
 		RETURN
-			(langtag).language
-			|| COALESCE('-' || (langtag).extlang, '')
-			|| COALESCE('-' || (langtag).script, '')
-			|| COALESCE('-' || (langtag).region, '')
+			langtag.language
+			|| COALESCE('-' || langtag.extlang, '')
+			|| COALESCE('-' || langtag.script, '')
+			|| COALESCE('-' || langtag.region, '')
 			|| CASE
-				WHEN array_length((langtag).variants, 1) > 0
-				THEN '-' || array_to_string((langtag).variants, '-')
+				WHEN array_length(langtag.variants, 1) > 0
+				THEN '-' || array_to_string(langtag.variants, '-')
 				ELSE ''
 			END
 			|| CASE
-				WHEN array_length((langtag).extensions, 1) > 0
-				THEN '-' || extensions_to_str((langtag).extensions)
+				WHEN array_length(langtag.extensions, 1) > 0
+				THEN '-' || extensions_to_str(langtag.extensions)
 				ELSE ''
 			END
 			|| CASE
-				WHEN array_length((langtag).privateuse, 1) > 0
-				THEN '-x-' || array_to_string((langtag).privateuse, '-')
+				WHEN array_length(langtag.privateuse, 1) > 0
+				THEN '-x-' || array_to_string(langtag.privateuse, '-')
 				ELSE ''
 			END
 		;
@@ -284,20 +294,65 @@ $$;
 
 
 CREATE FUNCTION canonicalize_language_tag_to_canonical_form(langtag language_tag, OUT res language_tag)
-	RETURNS language_tag LANGUAGE plpgsql STABLE RETURNS NULL ON NULL INPUT
+	LANGUAGE plpgsql STABLE RETURNS NULL ON NULL INPUT
 AS $$
+	DECLARE
+		i int;
+		j int;
+		primary_langtag language_tag;
 	BEGIN
-		res := langtag; -- TODO
+		res := langtag;
+		res.language := lower(res.language);
+		res.extlang  := lower(res.extlang);
+		res.script   := initcap(res.script);
+		res.region   := upper(res.region);
+		FOR i IN 1 .. array_length(res.variants, 1) LOOP
+			res.variants[i] := lower(res.variants[i]);
+		END LOOP;
+		FOR i IN 1 .. array_length(res.extensions, 1) LOOP
+			res.extensions[i].identifier := lower(res.extensions[i].identifier);
+			FOR j IN 1 .. array_length(res.extensions[i].subtags, 1) LOOP
+				res.extensions[i].subtags[j] := lower(res.extensions[i].subtags[j]);
+			END LOOP;
+		END LOOP;
+		FOR i IN 1 .. array_length(res.privateuse, 1) LOOP
+			res.privateuse[i] := lower(privateuse[i]);
+		END LOOP;
+		res.grandfathered := lower(res.grandfathered);
+		
+		IF res.extensions IS NOT NULL THEN
+			res.extensions := array_agg(SELECT * FROM unnest(res.extensions) AS t ORDER BY t.indentifier);
+		END IF;
+		
+		res := COALESCE(SELECT preferred_value FROM redundants WHERE tag = res, res);
+		res := COALESCE(SELECT preferred_value FROM grandfathereds WHERE tag = res.grandfathered, res);
+		
+		primary_langtag := SELECT preferred_value FROM extlangs WHERE subtag = res.extlang;
+		IF FOUND THEN
+			res.extlang := NULL;
+			res.language := primary_langtag.language;
+		END IF;
+		res.script := COALESCE(SELECT preferred_value FROM scripts WHERE subtag = res.script, res.script);
+		res.region := COALESCE(SELECT preferred_value FROM scripts WHERE subtag = res.region, res.region);
+		FOR i IN 1 .. array_length(res.variants, 1) LOOP
+			res.variants[i] := COALESCE(SELECT preferred_value FROM variants WHERE subtag = res.variants[i], res.variants[i]);
+		END LOOP;
+		
+		-- TODO: res.extlang can still be NOT NULL (see also the next function)
 	END
 $$;
 
 CREATE FUNCTION canonicalize_language_tag_to_extlang_form(langtag language_tag, OUT res language_tag)
-	RETURNS language_tag LANGUAGE plpgsql STABLE RETURNS NULL ON NULL INPUT
+	LANGUAGE plpgsql STABLE RETURNS NULL ON NULL INPUT
 AS $$
 	DECLARE
 		language language_subtag;
 	BEGIN
+		-- 1. Canonicalize language tag
 		res := canonicalize_language_tag_to_canonical_form(langtag);
+		-- 2. If language subtag is also extlang subtag, then
+		--    prepend tag with extlang prefix
+		-- res.language is already in lowercase
 		SELECT prefix FROM extlangs WHERE extlang = res.language INTO language;
 		IF FOUND THEN
 			res.extlang := res.language;
