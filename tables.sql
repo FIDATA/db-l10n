@@ -8,12 +8,12 @@
    it under the terms of the GNU General Public License as published by
    the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
-   
+
    DB-l10n is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
    GNU General Public License for more details.
-   
+
    You should have received a copy of the GNU General Public License
    along with DB-l10n.  If not, see <http://www.gnu.org/licenses/>.
 */
@@ -54,14 +54,14 @@ CREATE DOMAIN script_subtag character varying(4) COLLATE "C";
 CREATE DOMAIN region_subtag character varying(3) COLLATE "C";
 CREATE DOMAIN variant_subtag character varying(8) COLLATE "C";
 CREATE DOMAIN variant_subtags character varying(8)[] COLLATE "C";
-CREATE DOMAIN extension_singleton character(1) COLLATE "C";
+CREATE DOMAIN extension_identifier character(1) COLLATE "C"; -- <> 'x'
 CREATE DOMAIN extension_subtag character varying(8) COLLATE "C";
 CREATE DOMAIN extension_subtags character varying(8)[] COLLATE "C";
 CREATE TYPE extension AS (
--- 1. singleton is NOT NULL and differs from 'x'
+-- 1. identifier is NOT NULL and differs from 'x'
 -- 2. subtags have length >= 1
 -- 3. Each item in subtags has length > 0 (strictly speaking, 2 to 8)
-	singleton extension_singleton, -- subtag ? name ?
+	identifier extension_identifier, -- subtag ? name ?
 	subtags extension_subtags
 );
 -- [BCP47] isn't clear whether privateuse subtag is one group of from  1  to  8
@@ -93,59 +93,100 @@ CREATE TYPE language_tag AS (
 	grandfathered grandfathered_tag
 );
 
+
+/*
+   A tag is considered "valid" if it satisfies these conditions:
+
+   o  The tag is well-formed.
+
+   o  Either the tag is in the list of grandfathered tags or all of its
+      primary language, extended language, script, region, and variant
+      subtags appear in the IANA Language Subtag Registry as of the
+      particular registry date.
+
+   o  There are no duplicate variant subtags.
+
+   o  There are no duplicate singleton (extension) subtags.
+*/
+
 -- Validates language_tag
 -- Returns:
 --  0 = tag is valid
---  1 = tag is well-formed, but some non-custom subtags weren't found in database
+--  1 = tag is well-formed, but some non-custom subtags weren't recognized
 --  5 = invalid format
 CREATE FUNCTION validate_language_tag(langtag language_tag) RETURNS int
 	LANGUAGE plpgsql STABLE RETURNS NULL ON NULL INPUT
 AS $$
 	BEGIN
-	
+
 	END
 $$;
 
-CREATE FUNCTION str_to_extension(str character varying) RETURNS extension
+CREATE FUNCTION str_to_extension(str character varying, OUT res extension)
 	LANGUAGE plpgsql IMMUTABLE RETURNS NULL ON NULL INPUT
 AS $$
 	DECLARE
 		arr character varying[] COLLATE "C";
-		res extension;
 	BEGIN
 		arr := regexp_matches(str COLLATE "C", '^([0-9a-wy-z])((?:-[0-9A-Za-z]{2,8})+)$', 'ix');
-		res.singleton := arr[1];
+		res.identifier := arr[1];
 		res.subtags := string_to_array(arr[2], '-');
 		res.subtags := res.subtags[2:array_length(res.subtags, 1)];
-		RETURN res;
 	END
 $$;
 
-CREATE FUNCTION str_to_extensions(str character varying) RETURNS extension[]
+CREATE FUNCTION str_to_extensions(str character varying, OUT res extension[])
 	LANGUAGE plpgsql IMMUTABLE -- RETURNS empty array on NULL input
 AS $$
 	DECLARE
 		ext_str character varying COLLATE "C";
-		res extension[] = ARRAY[]::extension[];
 	BEGIN
+		res := ARRAY[]::extension[];
 		LOOP
 			ext_str := (regexp_matches(str COLLATE "C", '^(-[0-9a-wy-z](?:-[0-9A-Za-z]{2,8})+)', 'ix'))[1];
 			EXIT WHEN ext_str IS NULL;
 			res := res || str_to_extension(substr(ext_str, 2)); -- Removing '-' prefix
 			str := substr(str, char_length(ext_str) + 1);
 		END LOOP;
-		RETURN res;
 	END
 $$;
 
-CREATE FUNCTION str_to_langtag(str character varying) RETURNS language_tag
+CREATE FUNCTION str_to_langtag(str character varying, OUT res language_tag)
 	LANGUAGE plpgsql STABLE RETURNS NULL ON NULL INPUT
 AS $$
 	DECLARE
 		arr character varying[] COLLATE "C";
-		res language_tag;
 	BEGIN
-		IF lower(str COLLATE "C") IN (SELECT tag from grandfathereds) THEN
+-- Well-formedness doesn't depend on maybe wrong or incomplete content 
+--   of tables
+		IF lower(str COLLATE "C") IN (
+			'en-gb-oed',
+			'i-ami',
+			'i-bnn',
+			'i-default',
+			'i-enochian',
+			'i-hak',
+			'i-klingon',
+			'i-lux',
+			'i-mingo',
+			'i-navajo',
+			'i-pwn',
+			'i-tao',
+			'i-tay',
+			'i-tsu',
+			'sgn-be-fr',
+			'sgn-be-nl',
+			'sgn-ch-de',
+			'art-lojban',
+			'cel-gaulish',
+			'no-bok',
+			'no-nyn',
+			'zh-guoyu',
+			'zh-hakka',
+			'zh-min',
+			'zh-min-nan',
+			'zh-xiang'
+		) THEN
 			res.grandfathered := str;
 		ELSE
 			arr := regexp_matches(str COLLATE "C", '^
@@ -180,7 +221,6 @@ AS $$
 				res.privateuse := res.privateuse[2:array_length(res.privateuse, 1)];
 			END IF;
 		END IF;
-		RETURN res;
 	END
 $$;
 
@@ -188,7 +228,7 @@ CREATE FUNCTION extension_to_str(extension extension) RETURNS character varying
 	LANGUAGE plpgsql IMMUTABLE RETURNS NULL ON NULL INPUT
 AS $$
 	BEGIN
-		RETURN (extension).singleton || '-' || array_to_string((extension).subtags, '-');
+		RETURN (extension).identifier || '-' || array_to_string((extension).subtags, '-');
 	END
 $$;
 
@@ -242,13 +282,30 @@ AS $$
 	END
 $$;
 
-CREATE FUNCTION canonicalize_language_tag(langtag language_tag)
+
+CREATE FUNCTION canonicalize_language_tag_to_canonical_form(langtag language_tag, OUT res language_tag)
 	RETURNS language_tag LANGUAGE plpgsql STABLE RETURNS NULL ON NULL INPUT
 AS $$
 	BEGIN
-	
+		res := langtag; -- TODO
 	END
 $$;
+
+CREATE FUNCTION canonicalize_language_tag_to_extlang_form(langtag language_tag, OUT res language_tag)
+	RETURNS language_tag LANGUAGE plpgsql STABLE RETURNS NULL ON NULL INPUT
+AS $$
+	DECLARE
+		language language_subtag;
+	BEGIN
+		res := canonicalize_language_tag_to_canonical_form(langtag);
+		SELECT prefix FROM extlangs WHERE extlang = res.language INTO language;
+		IF FOUND THEN
+			res.extlang := res.language;
+			res.language := language;
+		END IF;
+	END
+$$;
+
 
 CREATE TYPE scope_enum AS ENUM (
 -- [BCP 47] Omission of scope field (i.e. NULL) means individual language
@@ -419,6 +476,26 @@ CREATE TABLE variant_comments (
 );
 
 
+-- Records for extensions are stored in the separate registry,
+--   with the following differences from records for other subtags:
+--   1. There is no Deprecated field
+--   2. There is only one Description field
+--   3. There could be at most one Comments field
+
+CREATE TABLE extensions (
+	identifier extension_identifier PRIMARY KEY, -- <> 'x'
+	added date NOT NULL,
+	description text NOT NULL,
+	comments text,
+-- TODO: Add length limits
+	rfc character varying NOT NULL,
+	authority character varying NOT NULL,
+	contacting_email character varying NOT NULL,
+	mailing_list character varying NOT NULL,
+	url character varying NOT NULL
+);
+
+
 CREATE TABLE grandfathereds (
 	tag grandfathered_tag PRIMARY KEY,
 	added date NOT NULL,
@@ -497,3 +574,70 @@ CREATE TYPE langtag_match_type AS ENUM (
 	'Script mismatch',
 	'No match'
 );
+
+
+
+CREATE FUNCTION localize_table(table_name name, columns name[], table_nsp_name name DEFAULT NULL) RETURNS VOID
+	LANGUAGE plpgsql VOLATILE
+AS $$
+	DECLARE
+		table_oid oid;
+		table_nsp_oid oid;
+		i RECORD;
+	BEGIN
+/*
+TODOs:
+1. Nonexisting columns in `columns`
+2. Check of datatype (character varying, text) (DOMAINS ?) (composite types ?)
+3. Indices ?
+4. Collation ?
+*/
+
+-- 		IF
+-- 			array_length(columns) = 0
+-- 		THEN
+
+		SELECT
+			oid
+		FROM
+			pg_namespace
+		WHERE
+			nspname = table_nsp_name
+		INTO STRICT
+			table_nsp_oid;
+		SELECT
+			oid
+		FROM
+			pg_class
+		WHERE
+			relname = table_name
+			AND relnamespace = table_nsp_oid
+		INTO STRICT
+			table_oid;
+		-- We rely on PostgreSQL's handling of types (column pg_attribute.atttypmod and function format_type)
+		-- Especially, number of dimensions in arrays don't checked since ...
+		EXECUTE '
+			CREATE TABLE '||COALESCE(quote_ident(table_nsp_name)||'.', '')||quote_ident(table_name||'_l10n')+' (
+				langtag '||l10n||'.language_tag PRIMARY KEY,
+				'||(
+					SELECT
+						string_agg(column_name_type, ', ')
+					FROM (
+						SELECT
+							quote_ident(attname)||' '|| format_type(atttypid, atttypmod) AS column_name_type
+						FROM
+							pg_attribute
+						WHERE
+							attrelid = table_oid
+							AND attname IN (unnest(columns))
+						ORDER BY
+							attnum
+					) AS columns
+				)
+			||');'
+		;
+		FOR i IN SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = table_oid AND attname IN (unnest(columns)) ORDER BY attnum LOOP
+
+		END LOOP;
+	END
+$$;
