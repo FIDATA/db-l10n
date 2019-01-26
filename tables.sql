@@ -29,6 +29,8 @@ TODOs:
 # Check for non-circular prefixes (and preferred-value)
 # Regions - hierarchy
 # No special checks for macrolanguage (scope, ...)
+
+# Full text search support
 */
 
 
@@ -68,9 +70,9 @@ CREATE DOMAIN extension_identifier character(1) COLLATE "C"; -- <> 'x'
 CREATE DOMAIN extension_subtag character varying(8) COLLATE "C";
 CREATE DOMAIN extension_subtags character varying(8)[] COLLATE "C";
 CREATE TYPE extension AS (
--- 1. identifier is NOT NULL and differs from 'x'
--- 2. subtags have length >= 1
--- 3. Each item in subtags has length > 0 (strictly speaking, 2 to 8)
+-- 1. "identifier" is NOT NULL and differs from 'x'
+-- 2. "subtags" have length >= 1
+-- 3. Each item in "subtags" has length 2 to 8
 	identifier extension_identifier, -- subtag ? name ?
 	subtags extension_subtags
 );
@@ -82,17 +84,18 @@ CREATE TYPE extension AS (
 CREATE DOMAIN privateuse_subtag character varying(8) COLLATE "C";
 CREATE DOMAIN privateuse_subtags character varying(8)[] COLLATE "C";
 CREATE DOMAIN grandfathered_tag character varying(11) COLLATE "C";
+CREATE DOMAIN grandfathered_tags character varying(11)[] COLLATE "C";
 CREATE TYPE language_tag AS (
--- 1. If grandfathered is NOT NULL, all other fields are NULL
--- 2. If privateuse contains at least one element, language can be NULL
--- 3. If language is  NULL,  all  fields  except  only  one  of  privateuse  or
---   grandfathered are NULL
--- 4. If language is NOT NULL, non-array fields (extlang,  script  and  region)
---   can be NULL, can't be empty strings. Array  fields  (variants,  extensions
---   and  privateuse) are NOT NULL, can be zero-length
--- 5. Elements of arrays  of  strings  (variants  and  privateuse)  are  always
+-- 1. If "grandfathered" is NOT NULL, all other fields are NULL
+-- 2. If "privateuse" contains at least one element, "language" can be NULL
+-- 3. If "language" is NULL, all fields, except only one from "privateuse"  and
+--   "grandfathered", are NULL
+-- 4. If "language" is NOT NULL,  non-array  fields  ("extlang",  "script"  and
+--   "region") can be NULL, can't be empty strings. Array  fields  ("variants",
+--   "extensions" and "privateuse") are NOT NULL, can be zero-length
+-- 5. Items of arrays of  strings  ("variants"  and  "privateuse")  are  always
 --   NOT NULL and have length > 0
--- 6. Rules for # are described above
+-- 6. Rules for items of "extensions" are described above
 	language language_subtag,
 	extlang extlang_subtag,
 	script script_subtag,
@@ -119,16 +122,212 @@ CREATE TYPE language_tag AS (
    o  There are no duplicate singleton (extension) subtags.
 */
 
+CREATE VIEW grandfathered_tags_list(tag) AS
+	SELECT
+		tag::grandfathered_tag
+	FROM
+		(VALUES
+			('en-GB-oed'),
+			('i-ami'),
+			('i-bnn'),
+			('i-default'),
+			('i-enochian'),
+			('i-hak'),
+			('i-klingon'),
+			('i-lux'),
+			('i-mingo'),
+			('i-navajo'),
+			('i-pwn'),
+			('i-tao'),
+			('i-tay'),
+			('i-tsu'),
+			('sgn-BE-FR'),
+			('sgn-BE-NL'),
+			('sgn-CH-DE'),
+			('art-lojban'),
+			('cel-gaulish'),
+			('no-bok'),
+			('no-nyn'),
+			('zh-guoyu'),
+			('zh-hakka'),
+			('zh-min'),
+			('zh-min-nan'),
+			('zh-xiang')
+		) AS grandfathered_tags_list(tag)
+;
+
 -- Validates language_tag
 -- Returns:
 --  0 = tag is valid
 --  1 = tag is well-formed, but some non-custom subtags weren't recognized
---  5 = invalid format
-CREATE FUNCTION validate_language_tag(langtag language_tag) RETURNS int
+--  5 = format of tag is invalid
+CREATE FUNCTION validate_language_tag(langtag language_tag, OUT res int)
 	LANGUAGE plpgsql STABLE RETURNS NULL ON NULL INPUT
 AS $$
+	DECLARE
+		variant variant_subtag;
+		extension extension; 
+		extension_subtag extension_subtag;
+		privateuse privateuse_subtag;
 	BEGIN
-
+		-- TODO: maybe use RE (we need check for alpha(num) characters and also check for length)
+		-- We can also made functions returning regular expressions for use them here and below
+		res := 0;
+		IF langtag.grandfathered IS NOT NULL THEN
+			IF
+				EXISTS(
+					SELECT
+						*
+					FROM
+						grandfathered_tags_list
+					WHERE
+						lower(tag) = lower(langtag.grandfathered)
+				)
+				AND langtag.language IS NULL
+				AND langtag.extlang IS NULL
+				AND langtag.script IS NULL
+				AND langtag.region IS NULL
+				AND langtag.variants IS NULL
+				AND langtag.extensions IS NULL
+				AND langtag.privateuse IS NULL
+			THEN
+				RETURN 0;
+			ELSE
+				RETURN 5;
+			END IF;
+		END IF;
+		IF langtag.privateuse IS NULL THEN
+			RETURN 5;
+		END IF;
+		FOREACH privateuse IN ARRAY langtag.privateuse LOOP
+			IF privateuse IS NULL OT char_length(private_use) = 0 THEN
+				RETURN 5;
+			END IF;
+		END LOOP;
+		IF
+			langtag.language IS NULL
+		THEN
+			IF 
+				langtag.extlang IS NULL
+				AND langtag.script IS NULL
+				AND langtag.region IS NULL
+				AND langtag.variants IS NULL
+				AND langtag.extensions IS NULL
+				AND array_length(langtag.privateuse, 1) > 0
+			THEN
+				RETURN 0;
+			ELSE
+				RETURN 5;
+			END IF;
+		END IF;
+		IF char_length(langtag.language) = 0 THEN
+			RETURN 5;
+		END IF;
+		IF -- TODO: custom subtags
+			NOT EXISTS(
+				SELECT
+						*
+					FROM
+						languages
+					WHERE
+						lower(subtag) = lower(langtag.language)
+			)
+		THEN
+			res := 1;
+		END IF;
+		-- TODO: check length
+		IF langtag.extlang IS NOT NULL THEN
+			IF char_length(langtag.extlang) = 0 THEN
+				RETURN 5;
+			END IF;
+			IF -- TODO: custom subtags
+				NOT EXISTS(
+					SELECT
+							*
+						FROM
+							extlangs
+						WHERE
+							lower(subtag) = lower(langtag.extlang)
+				)
+			THEN
+				res := 1;
+			END IF;
+		END IF;
+		-- TODO: check length
+		IF langtag.script IS NOT NULL THEN
+			IF char_length(langtag.script) = 0 THEN
+				RETURN 5;
+			END IF;
+			IF -- TODO: custom subtags
+				NOT EXISTS(
+					SELECT
+							*
+						FROM
+							scripts
+						WHERE
+							lower(subtag) = lower(langtag.script)
+				)
+			THEN
+				res := 1;
+			END IF;
+		END IF;
+		-- TODO: check length
+		IF langtag.region IS NOT NULL THEN
+			IF char_length(langtag.region) = 0 THEN
+				RETURN 5;
+			END IF;
+			IF -- TODO: custom subtags
+				NOT EXISTS(
+					SELECT
+							*
+						FROM
+							regions
+						WHERE
+							lower(subtag) = lower(langtag.region)
+				)
+			THEN
+				res := 1;
+			END IF;
+		END IF;
+		IF langtag.variants IS NULL THEN
+			RETURN 5;
+		END IF;
+		FOREACH variant IN ARRAY langtag.variants LOOP
+			IF variant IS NULL OR NOT (char_length(variant) BETWEEN 5 AND 8) THEN
+				RETURN 5;
+			END IF;
+			IF -- TODO: custom subtags
+				NOT EXISTS(
+					SELECT
+							*
+						FROM
+							variants
+						WHERE
+							lower(subtag) = lower(variant)
+				)
+			THEN
+				res := 1;
+			END IF;
+		END LOOP;
+		-- TODO: CHECK extensions
+		-- FOREACH extension IN ARRAY langtag.extensions LOOP
+			-- IF NOT
+			-- IF variant IS NULL OR NOT (char_length(variant) BETWEEN 5 AND 8) THEN
+				-- RETURN 5;
+			-- END IF;
+			-- IF -- TODO: custom subtags
+				-- NOT EXISTS(
+					-- SELECT
+							-- *
+						-- FROM
+							-- variants
+						-- WHERE
+							-- lower(subtag) = lower(variant)
+				-- )
+			-- THEN
+				-- res := 1;
+			-- END IF;
+		-- END LOOP;
 	END
 $$;
 
@@ -169,33 +368,13 @@ AS $$
 	BEGIN
 -- Well-formedness doesn't depend on maybe wrong or incomplete content 
 --   of tables
-		IF lower(str COLLATE "C") IN (
-			'en-gb-oed',
-			'i-ami',
-			'i-bnn',
-			'i-default',
-			'i-enochian',
-			'i-hak',
-			'i-klingon',
-			'i-lux',
-			'i-mingo',
-			'i-navajo',
-			'i-pwn',
-			'i-tao',
-			'i-tay',
-			'i-tsu',
-			'sgn-be-fr',
-			'sgn-be-nl',
-			'sgn-ch-de',
-			'art-lojban',
-			'cel-gaulish',
-			'no-bok',
-			'no-nyn',
-			'zh-guoyu',
-			'zh-hakka',
-			'zh-min',
-			'zh-min-nan',
-			'zh-xiang'
+		IF EXISTS(
+			SELECT
+				*
+			FROM
+				grandfathered_tags_list
+			WHERE
+				lower(tag) = lower(str COLLATE "C")
 		) THEN
 			res.grandfathered := str;
 		ELSE
@@ -257,7 +436,7 @@ AS $$
 $$;
 
 -- Converts language_tag to string
--- Supposes that language_tag is valid (TODO: maybe canonicalized ?)
+-- TODO: Does is suppose that language_tag is valid (or maybe canonicalized)?
 CREATE FUNCTION langtag_to_str(langtag language_tag) RETURNS character varying
 	LANGUAGE plpgsql IMMUTABLE RETURNS NULL ON NULL INPUT
 AS $$
@@ -341,7 +520,7 @@ AS $$
 			res.variants[i] := COALESCE(SELECT preferred_value FROM variants WHERE subtag = res.variants[i], res.variants[i]);
 		END LOOP;
 		
-		-- Handle Suppress-Script ?
+		-- TODO: Handle Suppress-Script ?
 		IF res.region = '001' THEN -- Ignore region-neutral ('World') tag
 			res.region := NULL;
 		END IF;
@@ -638,15 +817,39 @@ CREATE TYPE langtag_match_type AS ENUM (
 	'No match'
 );
 
+CREATE FUNCTION compare_langtags(langtag1 language_tag, langtag2 language_tag)
+	RETURNS langtag_match_type
+	LANGUAGE plpgsql STABLE RETURNS NULL ON NULL INPUT
+AS $$
+	BEGIN
+	
+	END
+$$;
+
+CREATE OPERATOR = (
+	LEFTARG = language_tag,
+	RIGHTARG = language_tag,
+	PROCEDURE = compare_langtags,
+	COMMUTATOR = =
+);
+
+
+
+
+CREATE TABLE orthographic_affinity(
+	langtag language_tag NOT NULL PRIMARY KEY,
+	affilangtag language_tag 
+);
+
 
 
 
 CREATE FUNCTION localize_table(
 	table_name name,
 	columns name[],
-	table_nsp_name name DEFAULT NULL
+	table_nsp_name name DEFAULT current_schema()
 ) RETURNS VOID
-	LANGUAGE plpgsql VOLATILE
+	LANGUAGE plpgsql VOLATILE -- TODO: RETURNS NULL ON NULL INPUT
 AS $$
 	DECLARE
 		table_oid oid;
@@ -664,7 +867,6 @@ TODOs:
 -- 		IF
 -- 			array_length(columns) = 0
 -- 		THEN
-
 		SELECT
 			oid
 		FROM

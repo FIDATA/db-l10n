@@ -1,0 +1,8 @@
+1. IANA Registry ?
+2. CLDR ?
+python-babel
+python-cldr
+3. ICU ?
+python-icu
+4. iso-codes
+5. country-list
